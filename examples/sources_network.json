@@ -1,0 +1,15 @@
+{
+  "nodes": [
+    {"id": "S1", "type": "source", "name": "一水厂"},
+    {"id": "S2", "type": "source", "name": "二水厂"},
+    {"id": "C",  "type": "junction", "name": "城东联络点"},
+    {"id": "U1", "type": "sink", "name": "幸福小区"},
+    {"id": "U2", "type": "sink", "name": "人民医院"}
+  ],
+  "pipes": [
+    {"id": "Q1", "from": "S1", "to": "C", "has_valve": true, "name": "一水厂出水阀"},
+    {"id": "Q3", "from": "S2", "to": "C", "has_valve": true, "name": "二水厂出水阀"},
+    {"id": "Q2", "from": "C", "to": "U1", "has_valve": true},
+    {"id": "Q4", "from": "C", "to": "U2", "has_valve": true}
+  ]
+}
