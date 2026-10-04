@@ -11,6 +11,7 @@ import psycopg2
 import psycopg2.extras
 from psycopg2.errors import UndefinedTable
 
+from . import audit
 from .config import get_settings
 from .planning import (
     Node,
@@ -105,7 +106,34 @@ CREATE TABLE IF NOT EXISTS state_snapshots (
 
 CREATE INDEX IF NOT EXISTS idx_state_snapshots_version
     ON state_snapshots (network_version);
+
+-- 快照摘要链：与 state_snapshots 一一对应，只增不改。
+-- digest/prev_digest 为 64 位十六进制 SHA-256；每条快照在原状态变更事务内接链。
+-- state_snapshots 永不删除/截断，故外键不加 ON DELETE 行为；整网导入不清空本表。
+-- 回滚造成的 BIGSERIAL 编号空洞不算断链：链接只指向“实际存在”的上一条快照。
+CREATE TABLE IF NOT EXISTS state_snapshot_chains (
+    snapshot_id  BIGINT PRIMARY KEY
+                     REFERENCES state_snapshots (id),
+    digest       TEXT NOT NULL CHECK (char_length(digest) = 64),
+    prev_digest  TEXT NOT NULL CHECK (char_length(prev_digest) = 64)
+);
+
+-- 建链起点（anchor）单行表：标明首次建链从哪条现存快照开始。
+-- anchor_kind = initial_backfill：首次启用时为现存快照建链（其前是否曾被改写不作断言）；
+-- anchor_kind = live_origin：空库启用，首条状态变更快照即为起点，直连创世摘要。
+CREATE TABLE IF NOT EXISTS state_snapshot_chain_meta (
+    id           INTEGER PRIMARY KEY DEFAULT 1,
+    anchor_snapshot_id BIGINT NOT NULL REFERENCES state_snapshots (id),
+    anchor_kind  TEXT NOT NULL CHECK (anchor_kind IN
+                     ('initial_backfill', 'live_origin')),
+    anchored_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT chain_meta_singleton CHECK (id = 1)
+);
 """
+
+# 事务级咨询锁：所有接链写入先取此锁，配合各写事务已持有的 network_meta
+# 行锁，保证并发写入下“上一条现存快照”的读取—接链串行化，绝不形成分叉。
+CHAIN_LOCK_KEY = 741289001
 
 # 事件状态：待修复 / 已复供
 EVENT_OPEN = "open"
@@ -149,6 +177,8 @@ def init_db() -> None:
                 with conn.cursor() as cur:
                     cur.execute(DDL)
                 _ensure_baseline_if_legacy(conn)
+                # 首次启用：为现存快照建立连续摘要链并标明建链起点（幂等）
+                anchor_snapshot_chain(conn)
                 conn.commit()
             return
         except (psycopg2.OperationalError, UndefinedTable) as exc:  # pragma: no cover
@@ -176,6 +206,7 @@ def _ensure_baseline_if_legacy(conn) -> None:
         op_type=OP_BASELINE,
         network_version=version,
         state=freeze_state(nodes, pipes, open_faults),
+        anchor_kind=audit.ANCHOR_INITIAL_BACKFILL,
     )
 
 
@@ -548,19 +579,77 @@ def insert_state_snapshot(
     network_version: int,
     state: dict,
     event_id: int | None = None,
+    anchor_kind: str | None = None,
 ) -> int:
-    """在调用方事务内冻结一条状态快照，返回不可复用的快照编号。
+    """在调用方事务内冻结一条状态快照并接入摘要链，返回不可复用的快照编号。
 
     仅插入、不更新、不删除；快照编号由 BIGSERIAL 全局单调分配，整网导入
-    也不重置该序列。必须在状态实际变更后、同一事务内调用。
+    也不重置该序列。必须在状态实际变更后、**同一事务**内调用：快照行与
+    摘要链行在同一事务内写入，事务回滚则二者同时回滚，链上不可能出现
+    “有链无快照”或“有快照无链”的半完成记录。
+
+    接链规则：链接编号严格小于自身的最近一条**现存**快照（回滚造成的
+    BIGSERIAL 空洞自动跳过）；该现存快照无链记录时 fail-closed 抛错，
+    绝不静默接创世摘要形成分叉。全库首条快照（无更早现存快照）使用固定
+    创世摘要，并把建链起点记为 anchor_kind：
+      - live_origin：空库启用后的正常首条快照；
+      - initial_backfill：旧库上线基线（与首次建链同批的现存快照）。
     """
     with conn.cursor() as cur:
+        # 接链临界区串行化：正常写路径已持有 network_meta FOR UPDATE，
+        # 咨询锁再兜底保证任何路径下并发写入都不会各自接上一条而分叉。
+        cur.execute("SELECT pg_advisory_xact_lock(%s)", (CHAIN_LOCK_KEY,))
+
         cur.execute(
             "INSERT INTO state_snapshots (op_type, network_version, event_id, state) "
-            "VALUES (%s, %s, %s, %s::jsonb) RETURNING id",
+            "VALUES (%s, %s, %s, %s::jsonb) "
+            "RETURNING id, created_at",
             (op_type, network_version, event_id, json.dumps(state)),
         )
-        return cur.fetchone()[0]
+        snapshot_id, created_at = cur.fetchone()
+
+        cur.execute(
+            "SELECT s.id, c.digest "
+            "FROM state_snapshots s "
+            "LEFT JOIN state_snapshot_chains c ON c.snapshot_id = s.id "
+            "WHERE s.id < %s ORDER BY s.id DESC LIMIT 1",
+            (snapshot_id,),
+        )
+        prev_row = cur.fetchone()
+        if prev_row is None:
+            prev_digest = audit.GENESIS_DIGEST
+            kind = anchor_kind or audit.ANCHOR_LIVE_ORIGIN
+        elif prev_row[1] is None:
+            # 上一条现存快照未入链：启动建链缺失或链被外部破坏，拒绝写出分叉链
+            raise RuntimeError(
+                f"快照 {prev_row[0]} 缺少摘要链记录，无法为快照 {snapshot_id} 接链"
+            )
+        else:
+            prev_digest = prev_row[1]
+            kind = None  # 已有起点，非 anchor
+
+        digest = audit.snapshot_digest(
+            snapshot_id=snapshot_id,
+            op_type=op_type,
+            network_version=network_version,
+            event_id=event_id,
+            created_at=created_at,
+            state=state,
+            prev_digest=prev_digest,
+        )
+        cur.execute(
+            "INSERT INTO state_snapshot_chains (snapshot_id, digest, prev_digest) "
+            "VALUES (%s, %s, %s)",
+            (snapshot_id, digest, prev_digest),
+        )
+        if kind is not None:
+            cur.execute(
+                "INSERT INTO state_snapshot_chain_meta "
+                "(id, anchor_snapshot_id, anchor_kind) "
+                "VALUES (1, %s, %s) ON CONFLICT (id) DO NOTHING",
+                (snapshot_id, kind),
+            )
+        return snapshot_id
 
 
 def get_state_snapshot(conn, snapshot_id: int) -> dict | None:
@@ -604,3 +693,157 @@ def get_previous_state_snapshot(conn, snapshot_id: int) -> dict | None:
         )
         row = cur.fetchone()
     return _serialize_snapshot_row(row) if row else None
+
+
+# ---------------------------------------------------------------- 快照摘要链
+
+
+def anchor_snapshot_chain(conn) -> dict | None:
+    """首次启用时为现存快照建立连续摘要链，并标明建链起点（幂等）。
+
+    - 链已存在：只补齐缺失的起点元数据（不改动任何既有摘要），返回 None；
+    - 快照表为空：不建链（首条状态变更快照将以 live_origin 直连创世摘要）；
+    - 链为空且存在快照：按编号升序为**所有现存快照**接链，首条以固定创世
+      摘要为前驱并记 anchor_kind=initial_backfill。这是首次启用建链：
+      此前快照是否曾被改写不作断言，链只保证建链之后可核验。
+
+    必须在 DDL（与旧库基线）之后、同一事务内执行。
+    """
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT count(*) AS n FROM state_snapshot_chains")
+        if cur.fetchone()["n"] > 0:
+            # 已有链：确保元数据指向最早入链快照，幂等不重算
+            cur.execute(
+                "INSERT INTO state_snapshot_chain_meta "
+                "(id, anchor_snapshot_id, anchor_kind) "
+                "SELECT 1, snapshot_id, %s FROM state_snapshot_chains "
+                "ORDER BY snapshot_id ASC LIMIT 1 "
+                "ON CONFLICT (id) DO NOTHING",
+                (audit.ANCHOR_INITIAL_BACKFILL,),
+            )
+            return None
+
+        cur.execute("SELECT count(*) AS n FROM state_snapshots")
+        if cur.fetchone()["n"] == 0:
+            return None
+
+        cur.execute("SELECT pg_advisory_xact_lock(%s)", (CHAIN_LOCK_KEY,))
+        cur.execute(
+            f"SELECT {_SNAPSHOT_COLUMNS} FROM state_snapshots ORDER BY id ASC"
+        )
+        rows = cur.fetchall()
+
+        prev_digest = audit.GENESIS_DIGEST
+        anchor_id = None
+        for idx, row in enumerate(rows):
+            sid = row["id"]
+            # 已存在链行（并发/部分建链）：沿用其摘要作为后继前驱，绝不重算覆盖
+            cur.execute(
+                "SELECT digest FROM state_snapshot_chains WHERE snapshot_id = %s",
+                (sid,),
+            )
+            existing = cur.fetchone()
+            if existing is not None:
+                # 沿用已存在链行的摘要作为后继前驱，绝不重算覆盖
+                prev_digest = existing["digest"]
+                if anchor_id is None:
+                    anchor_id = sid
+                continue
+            digest = audit.snapshot_digest(
+                snapshot_id=sid,
+                op_type=row["op_type"],
+                network_version=row["network_version"],
+                event_id=row["event_id"],
+                created_at=row["created_at"],
+                state=row["state"],
+                prev_digest=prev_digest,
+            )
+            cur.execute(
+                "INSERT INTO state_snapshot_chains (snapshot_id, digest, prev_digest) "
+                "VALUES (%s, %s, %s) ON CONFLICT (snapshot_id) DO NOTHING",
+                (sid, digest, prev_digest),
+            )
+            if anchor_id is None:
+                anchor_id = sid
+            prev_digest = digest
+
+        # 起点元数据缺失时才补写；若已存在（例如 live_origin 起点），保留原标记
+        cur.execute(
+            "INSERT INTO state_snapshot_chain_meta "
+            "(id, anchor_snapshot_id, anchor_kind) "
+            "SELECT 1, %s, %s WHERE NOT EXISTS (SELECT 1 FROM state_snapshot_chain_meta WHERE id = 1)",
+            (anchor_id, audit.ANCHOR_INITIAL_BACKFILL),
+        )
+    return {
+        "anchor_snapshot_id": anchor_id,
+        "anchor_kind": audit.ANCHOR_INITIAL_BACKFILL,
+        "snapshot_count": len(rows),
+    }
+
+
+def get_chain_meta(conn) -> dict | None:
+    """读取建链起点元数据；尚未启用（空库未写过快照）时返回 None。"""
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            "SELECT anchor_snapshot_id, anchor_kind, anchored_at "
+            "FROM state_snapshot_chain_meta WHERE id = 1"
+        )
+        row = cur.fetchone()
+    if row is None:
+        return None
+    return {
+        "anchor_snapshot_id": row["anchor_snapshot_id"],
+        "anchor_kind": row["anchor_kind"],
+        "anchored_at": row["anchored_at"],
+    }
+
+
+def get_chain_info(conn) -> dict:
+    """链总览：建链起点 + 现存/已入链快照数与最早/最晚编号（审计员选边界用）。"""
+    meta = get_chain_meta(conn)
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*), min(id), max(id), "
+            "(SELECT count(*) FROM state_snapshot_chains) "
+            "FROM state_snapshots"
+        )
+        total, min_id, max_id, chained = cur.fetchone()
+    return {
+        "anchor_snapshot_id": meta["anchor_snapshot_id"] if meta else None,
+        "anchor_kind": meta["anchor_kind"] if meta else None,
+        "anchored_at": meta["anchored_at"] if meta else None,
+        "snapshot_count": total,
+        "chained_count": chained,
+        "earliest_snapshot_id": min_id,
+        "latest_snapshot_id": max_id,
+    }
+
+
+def state_snapshot_exists(conn, snapshot_id: int) -> bool:
+    """快照编号是否实际存在（回滚空洞不算存在）。"""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM state_snapshots WHERE id = %s", (snapshot_id,)
+        )
+        return cur.fetchone() is not None
+
+
+def list_snapshot_chain_rows(conn, start_id: int, end_id: int) -> list[dict]:
+    """只读取出闭区间 [start_id, end_id] 内**实际存在**的快照及链摘要。
+
+    按编号升序；回滚造成的编号空洞自然不产生行（核验时不算断链）。
+    LEFT JOIN 使缺少链记录的快照（被外部破坏）也能返回，由核验逻辑定位
+    为链路断裂，而不是静默忽略。返回项含 stored_digest / stored_prev_digest。
+    """
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            f"SELECT s.id, s.op_type, s.network_version, s.event_id, "
+            f"s.state, s.created_at, c.digest AS stored_digest, "
+            f"c.prev_digest AS stored_prev_digest "
+            f"FROM state_snapshots s "
+            f"LEFT JOIN state_snapshot_chains c ON c.snapshot_id = s.id "
+            f"WHERE s.id BETWEEN %s AND %s ORDER BY s.id ASC",
+            (start_id, end_id),
+        )
+        rows = cur.fetchall()
+    return [dict(r) for r in rows]

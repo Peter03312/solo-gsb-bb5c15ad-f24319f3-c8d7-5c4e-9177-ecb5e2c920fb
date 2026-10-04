@@ -751,6 +751,89 @@ class SnapshotDiffOut(BaseModel):
     supplied_sinks: SuppliedSinksDiffOut
 
 
+# ---------------------------------------------------------------- 快照摘要链核验
+
+
+class AuditVerifyIn(BaseModel):
+    """调度审计员只读核验区间的入参。
+
+    pre_start_digest / end_digest 为审计员**事先离线保存**的摘要：
+    起点快照在区间起点之前的前一条摘要（核验首条入链快照时传创世摘要）、
+    终点快照自身摘要。
+    """
+
+    start_id: int = Field(ge=1, description="区间起始快照编号（含）")
+    end_id: int = Field(ge=1, description="区间终止快照编号（含，不得小于 start_id）")
+    pre_start_digest: str = Field(
+        min_length=64,
+        max_length=64,
+        description="事先保存的起点前摘要（64 位十六进制；首条入链快照传创世摘要）",
+    )
+    end_digest: str = Field(
+        min_length=64,
+        max_length=64,
+        description="事先保存的终点快照摘要（64 位十六进制）",
+    )
+
+    model_config = {"extra": "forbid"}
+
+
+class AuditDigestItemOut(BaseModel):
+    snapshot_id: int
+    digest: str
+    prev_digest: str
+
+
+class AuditFailureOut(BaseModel):
+    kind: str
+    snapshot_id: int | None = None
+    previous_snapshot_id: int | None = None
+    expected_digest: str | None = None
+    actual_digest: str | None = None
+    expected_prev_digest: str | None = None
+    actual_prev_digest: str | None = None
+    message: str
+
+
+class AuditVerifyOut(BaseModel):
+    """区间核验结果。
+
+    verdict：
+    - ok：区间内部链自洽，且起点前/终点摘要均与事先保存值相符；
+    - boundary_mismatch：内部链自洽，仅起点前或终点边界摘要不符；
+    - content_corrupted：首个可定位的内容损坏（冻结字段被事后改写）；
+    - chain_broken：首个可定位的链路断裂（前一条摘要指针不符或无链记录）。
+    """
+
+    ok: bool
+    verdict: str
+    start_snapshot_id: int
+    end_snapshot_id: int
+    genesis_digest: str
+    pre_start_digest: str
+    end_digest: str
+    expected_pre_start_digest: str | None
+    expected_end_digest: str | None
+    start_boundary_ok: bool | None
+    end_boundary_ok: bool | None
+    failure: AuditFailureOut | None
+    digests: list[AuditDigestItemOut]
+
+
+class AuditChainInfoOut(BaseModel):
+    """摘要链基本信息：创世摘要与建链起点（供审计员选取核验边界）。"""
+
+    genesis_digest: str
+    chain_tag: str
+    anchor_snapshot_id: int | None
+    anchor_kind: str | None
+    anchored_at: datetime | None
+    snapshot_count: int
+    chained_count: int
+    earliest_snapshot_id: int | None
+    latest_snapshot_id: int | None
+
+
 # ---------------------------------------------------------------- 调度演练
 
 

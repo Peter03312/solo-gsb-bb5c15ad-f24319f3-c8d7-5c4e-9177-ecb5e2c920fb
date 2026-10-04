@@ -22,6 +22,10 @@
 - GET  /api/snapshots                                  快照列表（按编号升序，支持 after 游标）
 - GET  /api/snapshots/{snapshot_id}                    按编号读取冻结快照（节点/水源/阀位/待修复故障/供水点）
 - GET  /api/snapshots/{snapshot_id}/diff               与相邻上一条快照的六类净变化（可用 base_id 指定对照基线）
+
+调度审计（快照摘要链）：
+- GET  /api/audit/chain                                摘要链信息（创世摘要、建链起点、现存/已入链快照范围）
+- POST /api/audit/verify                               只读核验快照区间：各条摘要与首个内容损坏/链路断裂位置
 """
 from contextlib import asynccontextmanager
 
@@ -29,6 +33,7 @@ from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 
 from . import db
+from . import audit
 from .config import get_settings
 from .planning import (
     Node,
@@ -84,6 +89,9 @@ from .schemas import (
     SnapshotOut,
     SnapshotMetaOut,
     SnapshotDiffOut,
+    AuditVerifyIn,
+    AuditVerifyOut,
+    AuditChainInfoOut,
 )
 from .serializers import (
     serialize_preview,
@@ -118,7 +126,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="供水管网故障隔离服务",
-    version="1.3.0",
+    version="1.4.0",
     lifespan=lifespan,
 )
 
@@ -800,6 +808,73 @@ def diff_snapshot(
     # 只基于两份冻结载荷计算，绝不读取当前管网或后续事件回填
     diff = diff_states(base["state"] if base else None, target["state"])
     return serialize_snapshot_diff(base, target, diff)
+
+
+# ---------------------------------------------------------------- 调度审计（快照摘要链）
+
+
+@app.get(
+    "/api/audit/chain",
+    response_model=AuditChainInfoOut,
+    tags=["调度审计"],
+    summary="摘要链信息：创世摘要、建链起点、现存/已入链快照范围（只读）",
+)
+def get_audit_chain():
+    with db.get_conn() as conn:
+        info = db.get_chain_info(conn)
+    return {
+        "genesis_digest": audit.GENESIS_DIGEST,
+        "chain_tag": audit.CHAIN_TAG,
+        **info,
+    }
+
+
+@app.post(
+    "/api/audit/verify",
+    response_model=AuditVerifyOut,
+    tags=["调度审计"],
+    summary="只读核验快照区间：返回各条摘要与首个可定位的内容损坏/链路断裂位置",
+)
+def audit_verify(payload: AuditVerifyIn):
+    # 请求边界先校验：倒序明确报错（格式非法由 pydantic 422 拦截）
+    if payload.end_id < payload.start_id:
+        raise ApiError(
+            422,
+            "AUDIT_RANGE_INVALID",
+            f"核验区间倒序：起始 {payload.start_id} 大于终止 {payload.end_id}",
+        )
+    if not audit.is_hex_digest(payload.pre_start_digest) or not audit.is_hex_digest(
+        payload.end_digest
+    ):
+        raise ApiError(
+            422,
+            "AUDIT_DIGEST_INVALID",
+            "起点前/终点摘要必须是 64 位十六进制 SHA-256 摘要",
+        )
+
+    with db.get_conn() as conn:
+        # 端点不存在须明确报错（回滚造成的编号空洞也算不存在）
+        if not db.state_snapshot_exists(conn, payload.start_id):
+            raise ApiError(
+                404,
+                "SNAPSHOT_NOT_FOUND",
+                f"核验区间起始快照不存在：{payload.start_id}",
+            )
+        if not db.state_snapshot_exists(conn, payload.end_id):
+            raise ApiError(
+                404,
+                "SNAPSHOT_NOT_FOUND",
+                f"核验区间终止快照不存在：{payload.end_id}",
+            )
+        rows = db.list_snapshot_chain_rows(
+            conn, payload.start_id, payload.end_id
+        )
+
+    return audit.verify_interval(
+        rows,
+        pre_start_digest=payload.pre_start_digest,
+        end_digest=payload.end_digest,
+    )
 
 
 # ---------------------------------------------------------------- 调度演练（只读）
