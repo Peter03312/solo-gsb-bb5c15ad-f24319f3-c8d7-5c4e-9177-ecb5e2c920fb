@@ -12,6 +12,12 @@
 **整网导入、隔离提交、复供确认、水源切换**每次实际改变状态时，在**同一事务**内冻结一条
 不可复用编号的**操作后状态快照**，供调度员按操作顺序回看当时的节点、水源运行状态、
 管段阀位、待修复故障与由运行水源可达的用水点，并支持相邻快照六类净变化对照。
+每条快照还在**同一事务**内冻结一条 SHA-256 **审计摘要**（固定可复现编码覆盖快照编号、
+操作类型、管网版本、关联事件、创建时间、完整冻结状态与前一条摘要，首条锚定固定创世摘要），
+按实际存在的快照编号接成连续链；首次启用时为现存快照一次性建链并标明建链起点
+（此前是否曾被改写不作断言），此后整网导入即使重置版本也不断链。调度审计员输入起止
+快照编号与事先保存的起点前、终点摘要，即可只读核验区间、取得各条摘要与首个可定位的
+内容损坏或链路断裂位置（内部链自洽但终点摘要不符时只报告边界不符；回滚编号空洞不算断链）。
 调度员还可在**现有阀位与故障状态**下携带各水源供水上限、各管段双向共用输水上限与
 用水点最低需求，**只读核算**管网能否满足这组用水点的最低流量（整数最大流）；
 供水不足时还可携带各用水点的**保障等级**（数字越小越优先），**只读核算分档交付**：
@@ -331,6 +337,36 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
   显式 `base_id` 必须与目标快照**相邻**，否则 `422 SNAPSHOT_NOT_ADJACENT`；
   未知快照编号统一 `404 SNAPSHOT_NOT_FOUND`，绝不静默返回当前状态。
 
+**调度审计摘要链（事后改写检测，只增不改）**：
+
+- 每条快照在其**原状态变更事务内**同时冻结一条 **SHA-256 摘要**，按实际存在的
+  快照编号顺序接成连续链；摘要以**固定、可复现编码**（单行 canonical JSON：
+  键按字典序、紧凑分隔、UTF-8；创建时间归一化为 UTC 微秒 `Z`）覆盖
+  **快照编号、操作类型、管网版本、关联事件、创建时间、完整冻结状态与前一条摘要**；
+  首条锚定固定创世摘要 `GENESIS`，链算法版本记为 `chain_version=1`；
+- **首次启用**时为现存快照按编号顺序一次性建链并标明**建链起点**
+  （`GET /api/snapshots/chain/status` 的 `start_snapshot_id`）；
+  建链之前是否曾被改写**不作断言**；空库首启则随首条快照（整网导入）自然起链；
+- 此后**每条**快照都在同一事务（持有 `network_meta` 行锁）内接链：
+  并发写入因此严格串行、**不会形成分叉**；**整网导入即使版本重置为 1 也不断链**
+  （快照表不截断，新快照接在既有链尾之后）；回滚事务在编号序列上留下的
+  **编号空洞不算断链**；
+- 审计员输入**起止快照编号**及**事先保存的起点前、终点摘要**，由
+  `POST /api/snapshots/chain/verify` **只读**核验闭区间：返回各条存储摘要、
+  按固定编码的重算摘要与两项判定（`content_ok` / `link_ok`），以及
+  **首个可定位的内容损坏或链路断裂位置** `first_issue`
+  （`SNAPSHOT_CONTENT_MISMATCH` 内容被改写 / `SNAPSHOT_CHAIN_BROKEN` 前链断裂 /
+  `SNAPSHOT_NOT_CHAINED` 建链后漏接）；
+- **内部链自洽但终点摘要不符**（或起点前摘要不符）只报告**边界不符**
+  （`end_digest_match` / `start_boundary_match` 为 `false`，`boundary_match=false`），
+  `first_issue` 仍为 `null`，不把区间之外的历史问题误报为区间内损坏；
+- **端点不存在**（含回滚编号空洞）统一 `404 SNAPSHOT_NOT_FOUND`，
+  **区间倒序**报 `422 SNAPSHOT_RANGE_INVALID`，摘要格式非法报
+  `422 SNAPSHOT_CHAIN_DIGEST_INVALID`，均明确报错；`start_prev_digest`
+  省略或为 `null` 时核验从全链首条开始（使用固定创世摘要）；
+- 审计链为纯增量：仅向快照表新增 `prev_digest` / `digest` / `chained_at` 列与
+  一张单行元数据表；**现有快照查询接口（列表/详情/对照）的字段与含义保持不变**。
+
 ## 五、HTTP API
 
 | 方法 | 路径 | 说明 |
@@ -354,6 +390,8 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 | GET | `/api/snapshots` | 状态快照列表（编号升序，`limit` / `after_id` 游标分页） |
 | GET | `/api/snapshots/{snapshot_id}` | 按编号读取冻结快照（节点/水源运行状态/管段阀位/待修复故障/可达用水点） |
 | GET | `/api/snapshots/{snapshot_id}/diff?base_id=` | 相邻快照六类净变化对照（缺省对照上一条；首条无基线全计为新增） |
+| GET | `/api/snapshots/chain/status` | 审计摘要链状态（启用标记、建链起点、创世摘要、链尾摘要与计数，只读） |
+| POST | `/api/snapshots/chain/verify` | 调度审计只读核验：起止编号闭区间 + 事先保存的起点前/终点摘要，返回各条摘要与首个损坏/断裂位置 |
 
 业务错误统一返回：
 
@@ -1381,6 +1419,133 @@ python3 examples/bypass_demo.py http://localhost:8000
 端点不存在/相同、编号未覆盖、容量非法的 422 拒绝 →
 确认版本、阀位、事件与管网全程未被改写。
 
+### 16. 调度审计：快照摘要链只读核验（事后改写检测）
+
+系统为每条状态快照在其**原状态变更事务内**冻结一条 SHA-256 摘要并按编号接成
+连续链，调度审计员据此核验冻结的操作后状态是否在事后被改写（接口**全程只读**）。
+
+先看建链状态（`enabled` 启用标记、`start_snapshot_id` 建链起点、
+`genesis_digest` 固定创世摘要、`last_digest` 当前链尾摘要）：
+
+```bash
+curl -s http://localhost:8000/api/snapshots/chain/status
+```
+
+```json
+{
+  "enabled": true,
+  "chain_version": 1,
+  "start_snapshot_id": 1,
+  "genesis_digest": "8b2f...（64 位十六进制）",
+  "built_at": null,
+  "snapshot_count": 3,
+  "unchained_count": 0,
+  "last_snapshot_id": 3,
+  "last_digest": "d71b...（64 位十六进制）"
+}
+```
+
+审计员在核验前**事先保存**“起点前摘要”（核验全链首条时即固定创世摘要；
+核验子区间时为区间首条之前一条快照的摘要）与“终点摘要”，然后发起只读核验。
+**核验请求示例**：
+
+```bash
+curl -s -X POST http://localhost:8000/api/snapshots/chain/verify \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "start_id": 1,
+    "end_id": 3,
+    "start_prev_digest": null,
+    "end_digest": "d71bb0124643737f770dcf1970d8550b9d25410e16df42851d1dc0ae385f2ff1"
+  }'
+```
+
+- `start_prev_digest` 省略或为 `null` 表示从全链首条核验，使用固定创世摘要；
+- `end_digest` 可选：提供时用于“终点边界”比对。
+
+区间完好时的响应（节选）：`chain_intact=true`、`boundary_match=true`，
+逐条给出存储摘要 `digest`、按固定编码重算的 `computed_digest` 与
+`content_ok` / `link_ok`，`first_issue` 为 `null`：
+
+```json
+{
+  "start_snapshot_id": 1,
+  "end_snapshot_id": 3,
+  "chain_intact": true,
+  "boundary_match": true,
+  "start_prev_digest": "8b2f...",
+  "start_boundary_match": true,
+  "end_digest": "d71b...",
+  "expected_end_digest": "d71b...",
+  "end_digest_match": true,
+  "entries": [
+    {"snapshot_id": 1, "digest": "b0b3...", "computed_digest": "b0b3...",
+     "prev_digest": "8b2f...", "content_ok": true, "link_ok": true},
+    {"snapshot_id": 2, "digest": "7267...", "computed_digest": "7267...",
+     "prev_digest": "b0b3...", "content_ok": true, "link_ok": true},
+    {"snapshot_id": 3, "digest": "d71b...", "computed_digest": "d71b...",
+     "prev_digest": "7267...", "content_ok": true, "link_ok": true}
+  ],
+  "first_issue": null
+}
+```
+
+若有人事后直接改写了某条快照的冻结状态（或操作类型/版本/关联事件/创建时间/
+前链摘要中任一字段），重算摘要即与存储摘要不符，`first_issue` 给出
+**首个可定位位置**（本例快照 2 内容损坏），并同时给出存储值与重算值：
+
+```json
+{
+  "chain_intact": false,
+  "boundary_match": false,
+  "first_issue": {
+    "code": "SNAPSHOT_CONTENT_MISMATCH",
+    "snapshot_id": 2,
+    "previous_snapshot_id": 1,
+    "message": "快照 2 的重算摘要与存储摘要不符，其冻结内容或链字段在事后被改写",
+    "stored_digest": "7267...",
+    "computed_digest": "1f0a...",
+    "expected_prev_digest": "b0b3...",
+    "stored_prev_digest": "b0b3..."
+  }
+}
+```
+
+若某条快照的 `prev_digest` 指针与编号上一条实际存在快照的摘要不一致
+（分叉/历史被整条重写），报 `SNAPSHOT_CHAIN_BROKEN`（含
+`expected_prev_digest` 与 `stored_prev_digest`）；建链之后漏接链的快照报
+`SNAPSHOT_NOT_CHAINED`。**回滚造成的编号空洞不算断链**：取区间时只返回实际
+存在的快照，按其编号顺序逐行接链。
+
+本轮用法要点：
+
+- **摘要覆盖完整冻结状态**：快照编号、操作类型、管网版本、关联事件、创建时间、
+  完整冻结状态（节点/水源运行状态/管段阀位/待修复故障/可达用水点）与前一条摘要；
+  编码固定可复现（canonical JSON + UTC 微秒 `Z` 时间），同内容必同摘要。
+- **内部自洽、边界不符单独报告**：区间内部完全自洽但审计员保存的终点摘要
+  （或起点前摘要）对不上时，只置 `end_digest_match` / `start_boundary_match`
+  为 `false`，`first_issue` 仍为 `null`——区间之外是否被改写不在本区间断言。
+- **整网导入不断链**：重导后版本重置为 1，但快照编号继续递增、新快照接在旧链尾
+  之后；可用 `[旧首条, 新快照]` 跨重导核验。
+- **错误约定明确**：`start_id`/`end_id` 端点不存在（含空洞）→
+  `404 SNAPSHOT_NOT_FOUND`；`end_id < start_id` 倒序 →
+  `422 SNAPSHOT_RANGE_INVALID`；摘要不是 64 位十六进制 →
+  `422 SNAPSHOT_CHAIN_DIGEST_INVALID`（摘要大小写不敏感，内部统一按小写比较）。
+- **既有接口不变**：摘要链只新增列与元数据表，`/api/snapshots` 列表、
+  `/api/snapshots/{id}` 详情、`/api/snapshots/{id}/diff` 对照的字段与含义保持不变。
+
+调度审计全流程演示脚本（标准库实现，全程只读）：
+
+```bash
+python3 examples/snapshot_audit_demo.py
+# 或指定地址：
+python3 examples/snapshot_audit_demo.py http://localhost:8000
+```
+
+脚本依次演示：读取建链状态 → 保存起点前/终点摘要 → 全区间与子区间只读核验 →
+整网重导（版本重置）后跨重导核验连续 → 倒序/端点不存在/摘要格式非法的明确报错 →
+内部自洽但终点摘要不符时只报告边界不符，并附一份可直接使用的核验 `curl` 请求。
+
 ### 一键完整演示脚本（标准库实现，无需安装依赖）
 
 ```bash
@@ -1423,15 +1588,23 @@ python3 examples/bypass_demo.py
 python3 examples/bypass_demo.py http://localhost:8000
 ```
 
+调度审计摘要链核验流程（建链状态 → 全区间/子区间只读核验 → 整网重导不断链 → 倒序/端点不存在/摘要非法报错 → 内部自洽但终点不符只报边界）：
+
+```bash
+python3 examples/snapshot_audit_demo.py
+# 或指定地址：
+python3 examples/snapshot_audit_demo.py http://localhost:8000
+```
+
 ## 七、测试
 
-核心图算法与校验逻辑（`tests/test_planning.py`，114 个用例）不依赖数据库与第三方库，可直接用标准库运行：
+核心图算法与校验逻辑（`tests/test_planning.py`，130 个用例）不依赖数据库与第三方库，可直接用标准库运行：
 
 ```bash
 python3 -m unittest tests.test_planning -v
 ```
 
-路由层集成测试（`tests/test_api.py`，114 个用例）用内存替身替换数据库，覆盖完整 HTTP 契约（含关阀建议、复供预演/确认、水源停运/恢复预演与确认、流量只读核算、**保障等级分档交付（等级总量/逐点字典序/阻断口径/422/只读）**、读数核对（一致性/缺报范围/硬约束/422）、**调度演练（逐步预检/临时事件引用/首败即停/409/只读）**、**临时旁通管评估（基线对照/重新进水判不可用/并联/422/只读）**、版本与安全拒绝、整网替换失效、状态快照冻结/读取/相邻对照/失败不留痕/重导不覆盖），需先安装依赖：
+路由层集成测试（`tests/test_api.py`，133 个用例）用内存替身替换数据库，覆盖完整 HTTP 契约（含关阀建议、复供预演/确认、水源停运/恢复预演与确认、流量只读核算、**保障等级分档交付（等级总量/逐点字典序/阻断口径/422/只读）**、读数核对（一致性/缺报范围/硬约束/422）、**调度演练（逐步预检/临时事件引用/首败即停/409/只读）**、**临时旁通管评估（基线对照/重新进水判不可用/并联/422/只读）**、版本与安全拒绝、整网替换失效、状态快照冻结/读取/相邻对照/失败不留痕/重导不覆盖、**审计摘要链（同事务接链/只读核验/内容损坏与断链定位/边界不符/回滚空洞/端点与倒序报错/首启建链/整网重导不断链/既有快照接口字段不变）**），需先安装依赖：
 
 ```bash
 pip install -r requirements.txt httpx
@@ -1444,8 +1617,8 @@ python3 -m unittest discover -s tests -v
 app/
   config.py       # 环境变量配置
   schemas.py      # Pydantic 请求/响应模型
-  planning.py     # 纯领域逻辑：导入校验、无向图可达性(BFS，仅运行水源)、隔离评估、复供安全评估、关阀建议、水源切换评估、流量核算(校验+整数无向最大流)、保障等级分档交付(有下界整数环流+残量环流补偿的字典序最大流)、临时旁通管评估(内存接入旁通的基线/交付对照与重新进水判定)、读数核对(校验+整数有界可行流+缺报流量范围)、调度演练(状态副本上逐步套用提交校验的只读推演)、状态快照冻结与相邻对照
-  db.py           # PostgreSQL：DDL/迁移、快照、整网导入、事务化隔离提交、事务化复供、事务化水源切换、状态快照写入/读取、旧库上线基线、历史
+  planning.py     # 纯领域逻辑：导入校验、无向图可达性(BFS，仅运行水源)、隔离评估、复供安全评估、关阀建议、水源切换评估、流量核算(校验+整数无向最大流)、保障等级分档交付(有下界整数环流+残量环流补偿的字典序最大流)、临时旁通管评估(内存接入旁通的基线/交付对照与重新进水判定)、读数核对(校验+整数有界可行流+缺报流量范围)、调度演练(状态副本上逐步套用提交校验的只读推演)、状态快照冻结与相邻对照、审计摘要链(SHA-256 固定可复现编码/创世摘要/区间只读核验与首个损坏或断裂定位)
+  db.py           # PostgreSQL：DDL/迁移、快照、整网导入、事务化隔离提交、事务化复供、事务化水源切换、状态快照写入/读取、旧库上线基线、审计摘要链同事务接链/首启建链/只读核验取数、历史
   serializers.py  # 响应序列化
   main.py         # FastAPI 路由与错误处理
 examples/
@@ -1462,6 +1635,7 @@ examples/
   drill_demo.py           # 调度演练全流程示例（只读：有序步骤逐步预检、临时事件引用、首败即停、409/只读核对）
   bypass_demo.py          # 临时旁通管评估全流程示例（只读：基线/旁通交付对照与差值、重新进水判不可用、并联、422）
   snapshot_demo.py        # 状态快照回看全流程示例（四类操作冻结/读取/对照/不留痕/重导不覆盖）
+  snapshot_audit_demo.py  # 调度审计摘要链核验示例（只读：建链状态、区间核验、损坏/断链与边界不符、整网重导不断链、报错约定）
 tests/
   test_planning.py
   test_api.py

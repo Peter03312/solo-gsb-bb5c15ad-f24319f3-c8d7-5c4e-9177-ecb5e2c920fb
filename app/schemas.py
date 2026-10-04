@@ -751,6 +751,82 @@ class SnapshotDiffOut(BaseModel):
     supplied_sinks: SuppliedSinksDiffOut
 
 
+# ---------------------------------------------------------------- 审计摘要链
+
+
+class SnapshotChainVerifyIn(BaseModel):
+    """调度审计员的只读核验请求：闭区间 [start_id, end_id] + 事先保存的边界摘要。"""
+
+    start_id: int = Field(ge=1, description="起始快照编号（含）")
+    end_id: int = Field(ge=1, description="终止快照编号（含）")
+    # 审计员在区间起始快照之前事先保存的前一条摘要；
+    # 缺省（null）表示从全链首条开始核验，使用固定创世摘要。
+    start_prev_digest: str | None = Field(
+        default=None,
+        description="起始快照之前一条（事先保存）的 SHA-256 摘要；"
+        "省略或 null 时使用固定创世摘要",
+    )
+    # 审计员事先保存的终点摘要；内部链自洽但与此不符时只报告边界不符。
+    end_digest: str | None = Field(
+        default=None,
+        description="事先保存的终点快照 SHA-256 摘要（可选）",
+    )
+
+
+class SnapshotChainEntryOut(BaseModel):
+    """区间内单条快照的核验结果：存储摘要、按固定编码重算的摘要与两项判定。"""
+
+    snapshot_id: int
+    digest: str | None
+    computed_digest: str | None
+    prev_digest: str | None
+    content_ok: bool
+    link_ok: bool
+
+
+class SnapshotChainIssueOut(BaseModel):
+    """首个可定位的内容损坏或链路断裂位置（内部自洽、仅边界不符时为 null）。"""
+
+    code: str
+    snapshot_id: int
+    previous_snapshot_id: int | None
+    message: str
+    stored_digest: str | None = None
+    computed_digest: str | None = None
+    expected_prev_digest: str | None = None
+    stored_prev_digest: str | None = None
+
+
+class SnapshotChainVerifyOut(BaseModel):
+    """只读核验结果：区间各条摘要、首个内部问题位置与两个外部边界判定。"""
+
+    start_snapshot_id: int | None
+    end_snapshot_id: int | None
+    chain_intact: bool
+    boundary_match: bool
+    start_prev_digest: str
+    start_boundary_match: bool | None
+    end_digest: str | None
+    expected_end_digest: str | None
+    end_digest_match: bool | None
+    entries: list[SnapshotChainEntryOut]
+    first_issue: SnapshotChainIssueOut | None
+
+
+class SnapshotChainStatusOut(BaseModel):
+    """摘要链建链状态：是否已启用、建链起点、创世摘要、链尾摘要与存量计数。"""
+
+    enabled: bool
+    chain_version: int
+    start_snapshot_id: int | None
+    genesis_digest: str
+    built_at: datetime | None
+    snapshot_count: int
+    unchained_count: int
+    last_snapshot_id: int | None
+    last_digest: str | None
+
+
 # ---------------------------------------------------------------- 调度演练
 
 

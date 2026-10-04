@@ -2005,6 +2005,357 @@ class BypassEvaluationTests(unittest.TestCase):
         )
         self.assertEqual(issues, [])
 
+if __name__ == "__main__":
+    unittest.main()
+
+
+# ============================================================
+# 审计摘要链：固定编码、确定性、事后改写检测、边界语义
+# ============================================================
+
+import datetime as _datetime  # noqa: E402
+
+from app.planning import (  # noqa: E402
+    CHAIN_VERSION,
+    GENESIS_DIGEST,
+    ISSUE_SNAPSHOT_CHAIN_BROKEN,
+    ISSUE_SNAPSHOT_CONTENT_MISMATCH,
+    ISSUE_SNAPSHOT_NOT_CHAINED,
+    compute_snapshot_digest,
+    is_sha256_hex,
+    normalize_created_at,
+    snapshot_digest_payload,
+    verify_snapshot_chain,
+)
+
+
+def _chain_entry(snapshot_id, *, prev, state=None, op_type="network_import",
+                 network_version=1, event_id=None, created_at=None,
+                 digest=None, prev_override=None):
+    """构造一条已链接的链条目（digest 默认按编码计算，便于测试改写场景）。"""
+    created_at = created_at or _datetime.datetime(2026, 10, 1, 8, 0, 0)
+    state = state if state is not None else {"k": snapshot_id}
+    stored_prev = prev if prev_override is None else prev_override
+    stored_digest = digest if digest is not None else compute_snapshot_digest(
+        snapshot_id=snapshot_id,
+        op_type=op_type,
+        network_version=network_version,
+        event_id=event_id,
+        created_at=created_at,
+        state=state,
+        prev_digest=stored_prev,
+    )
+    return {
+        "id": snapshot_id,
+        "op_type": op_type,
+        "network_version": network_version,
+        "event_id": event_id,
+        "created_at": created_at,
+        "state": state,
+        "prev_digest": stored_prev,
+        "digest": stored_digest,
+    }
+
+
+def _chain(ids, **kw):
+    entries = []
+    prev = GENESIS_DIGEST
+    for sid in ids:
+        e = _chain_entry(sid, prev=prev, **kw)
+        entries.append(e)
+        prev = e["digest"]
+    return entries
+
+
+class SnapshotDigestEncodingTests(unittest.TestCase):
+    def test_genesis_digest_is_fixed_sha256(self):
+        import hashlib
+
+        expected = hashlib.sha256(
+            "water-network snapshot chain v1 genesis".encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(GENESIS_DIGEST, expected)
+        self.assertEqual(CHAIN_VERSION, 1)
+        self.assertTrue(is_sha256_hex(GENESIS_DIGEST))
+        self.assertTrue(is_sha256_hex(GENESIS_DIGEST.upper()))
+        self.assertFalse(is_sha256_hex("abc"))
+        self.assertFalse(is_sha256_hex(None))
+        self.assertFalse(is_sha256_hex("g" * 64))
+
+    def test_digest_is_deterministic_and_key_order_independent(self):
+        kwargs = dict(
+            snapshot_id=3,
+            op_type="isolation_submit",
+            network_version=2,
+            event_id=7,
+            created_at=_datetime.datetime(2026, 10, 1, 8, 0, 0),
+            state={"b": [1, 2], "a": {"z": 1, "y": 2}},
+            prev_digest=GENESIS_DIGEST,
+        )
+        d1 = compute_snapshot_digest(**kwargs)
+        # 相同输入 -> 相同摘要；输入状态键序不同但语义相同 -> 相同摘要
+        kwargs2 = dict(kwargs)
+        kwargs2["state"] = {"a": {"y": 2, "z": 1}, "b": [1, 2]}
+        d2 = compute_snapshot_digest(**kwargs2)
+        self.assertEqual(d1, d2)
+        self.assertTrue(is_sha256_hex(d1))
+
+        # 直接验证 canonical 编码：单行、键字典序、紧凑
+        payload = snapshot_digest_payload(**kwargs).decode("utf-8")
+        self.assertNotIn("\n", payload)
+        self.assertNotIn(", ", payload)
+        self.assertIn('"chain_version":1', payload)
+        self.assertLess(payload.index('"created_at"'), payload.index('"event_id"'))
+        # state 作为嵌套对象，内部键序同样归一化（a 在 b 前）
+        self.assertIn('"state":{"a":{"y":2,"z":1},"b":[1,2]}', payload)
+
+    def test_every_covered_field_changes_digest(self):
+        base = dict(
+            snapshot_id=1,
+            op_type="network_import",
+            network_version=1,
+            event_id=None,
+            created_at=_datetime.datetime(2026, 10, 1, 8, 0, 0),
+            state={"nodes": [], "pipes": []},
+            prev_digest=GENESIS_DIGEST,
+        )
+        baseline = compute_snapshot_digest(**base)
+
+        variants = [
+            ("snapshot_id", dict(snapshot_id=2)),
+            ("op_type", dict(op_type="source_switch")),
+            ("network_version", dict(network_version=9)),
+            ("event_id", dict(event_id=5)),
+            ("created_at", dict(created_at=_datetime.datetime(2026, 10, 2, 8, 0, 0))),
+            ("state", dict(state={"nodes": [{"id": "X"}], "pipes": []})),
+            ("prev_digest", dict(prev_digest="a" * 64)),
+        ]
+        for name, change in variants:
+            with self.subTest(field=name):
+                merged = dict(base)
+                merged.update(change)
+                self.assertNotEqual(compute_snapshot_digest(**merged), baseline)
+
+    def test_state_nested_change_detected_even_same_length(self):
+        # 同长度的内容篡改（U3 -> U9）必须改变摘要
+        s1 = dict(
+            snapshot_id=1, op_type="network_import", network_version=1,
+            event_id=None,
+            created_at=_datetime.datetime(2026, 10, 1, 8, 0, 0),
+            state={"supplied_sink_ids": ["U1", "U3"]},
+            prev_digest=GENESIS_DIGEST,
+        )
+        s2 = dict(s1)
+        s2["state"] = {"supplied_sink_ids": ["U1", "U9"]}
+        self.assertNotEqual(
+            compute_snapshot_digest(**s1), compute_snapshot_digest(**s2)
+        )
+
+    def test_created_at_timezone_normalization_is_reproducible(self):
+        naive = _datetime.datetime(2026, 10, 1, 8, 0, 0)
+        utc = naive.replace(tzinfo=_datetime.timezone.utc)
+        # 同一时刻在 +09:00 时区的表示：17:00 +09:00
+        tokyo = utc.astimezone(_datetime.timezone(_datetime.timedelta(hours=9)))
+        self.assertEqual(
+            normalize_created_at(naive),
+            normalize_created_at(utc),
+        )
+        self.assertEqual(
+            normalize_created_at(naive),
+            normalize_created_at(tokyo),
+        )
+        self.assertEqual(
+            normalize_created_at("2026-10-01T08:00:00Z"),
+            normalize_created_at(naive),
+        )
+        self.assertEqual(
+            normalize_created_at("2026-10-01T17:00:00+09:00"),
+            normalize_created_at(naive),
+        )
+        self.assertTrue(normalize_created_at(naive).endswith("Z"))
+
+    def test_aware_vs_string_same_instant_same_digest(self):
+        aware = _datetime.datetime(2026, 10, 1, 8, 0, 0,
+                                   tzinfo=_datetime.timezone.utc)
+        common = dict(
+            snapshot_id=1, op_type="network_import", network_version=1,
+            event_id=None, state={"x": 1}, prev_digest=GENESIS_DIGEST,
+        )
+        d1 = compute_snapshot_digest(created_at=aware, **common)
+        d2 = compute_snapshot_digest(
+            created_at="2026-10-01T08:00:00.000000Z", **common
+        )
+        self.assertEqual(d1, d2)
+
+
+class SnapshotChainVerificationTests(unittest.TestCase):
+    def test_clean_chain_passes_and_links_to_genesis(self):
+        entries = _chain([1, 2, 3])
+        result = verify_snapshot_chain(entries)
+        self.assertTrue(result["chain_intact"])
+        self.assertTrue(result["boundary_match"])
+        self.assertTrue(result["start_boundary_match"])
+        self.assertIsNone(result["end_digest_match"])  # 未提供终点摘要
+        self.assertIsNone(result["first_issue"])
+        self.assertEqual(
+            [e["snapshot_id"] for e in result["entries"]], [1, 2, 3]
+        )
+        self.assertTrue(all(e["content_ok"] and e["link_ok"]
+                            for e in result["entries"]))
+        self.assertEqual(result["end_digest"], entries[-1]["digest"])
+        # 首条 prev_digest 即创世摘要
+        self.assertEqual(entries[0]["prev_digest"], GENESIS_DIGEST)
+
+    def test_range_with_supplied_anchors(self):
+        entries = _chain([1, 2, 3, 4])
+        # 核验子区间 [2,4]：起点前摘要 = 快照 1 的摘要，终点摘要 = 快照 4
+        sub = entries[1:]
+        result = verify_snapshot_chain(
+            sub,
+            start_prev_digest=entries[0]["digest"],
+            end_digest=entries[-1]["digest"],
+        )
+        self.assertTrue(result["chain_intact"])
+        self.assertTrue(result["boundary_match"])
+        self.assertTrue(result["start_boundary_match"])
+        self.assertTrue(result["end_digest_match"])
+
+    def test_end_digest_mismatch_is_boundary_only(self):
+        # 区间内部完全自洽，但审计员保存的终点摘要不同 -> 仅边界不符
+        entries = _chain([1, 2, 3])
+        result = verify_snapshot_chain(
+            entries, start_prev_digest=GENESIS_DIGEST, end_digest="b" * 64
+        )
+        self.assertTrue(result["chain_intact"])
+        self.assertIsNone(result["first_issue"])
+        self.assertFalse(result["end_digest_match"])
+        self.assertFalse(result["boundary_match"])
+        self.assertTrue(result["start_boundary_match"])
+
+    def test_start_anchor_mismatch_is_boundary_only(self):
+        entries = _chain([3, 4])
+        # 审计员保存了错误的“起点前摘要”，但区间 [3,4] 内部自洽
+        result = verify_snapshot_chain(
+            entries, start_prev_digest="c" * 64, end_digest=entries[-1]["digest"]
+        )
+        self.assertTrue(result["chain_intact"])
+        self.assertIsNone(result["first_issue"])
+        self.assertFalse(result["start_boundary_match"])
+        self.assertFalse(result["boundary_match"])
+
+    def test_content_tamper_detected_and_located(self):
+        entries = _chain([1, 2, 3])
+        # 篡改快照 2 的冻结状态，但保留其存储摘要/指针
+        entries[1]["state"] = {"tampered": True}
+        result = verify_snapshot_chain(entries)
+        self.assertFalse(result["chain_intact"])
+        issue = result["first_issue"]
+        self.assertEqual(issue["code"], ISSUE_SNAPSHOT_CONTENT_MISMATCH)
+        self.assertEqual(issue["snapshot_id"], 2)
+        self.assertNotEqual(
+            issue["stored_digest"], issue["computed_digest"]
+        )
+        # 快照 2 的内容失配，快照 3 仍然链接正确（链尚未断）
+        flags = {e["snapshot_id"]: e for e in result["entries"]}
+        self.assertFalse(flags[2]["content_ok"])
+        self.assertTrue(flags[2]["link_ok"])
+        self.assertTrue(flags[3]["content_ok"])
+        self.assertTrue(flags[3]["link_ok"])
+
+    def test_chain_break_detected_and_located(self):
+        entries = _chain([1, 2, 3])
+        # 把快照 3 的 prev 指针改成别的摘要（分叉/历史重写）
+        entries[2]["prev_digest"] = "f" * 64
+        # 重算其 digest，使内容本身与（错误的）prev 自洽：此时只能报链路断裂
+        entries[2]["digest"] = compute_snapshot_digest(
+            snapshot_id=3, op_type=entries[2]["op_type"],
+            network_version=entries[2]["network_version"],
+            event_id=entries[2]["event_id"],
+            created_at=entries[2]["created_at"],
+            state=entries[2]["state"],
+            prev_digest="f" * 64,
+        )
+        result = verify_snapshot_chain(entries)
+        self.assertFalse(result["chain_intact"])
+        issue = result["first_issue"]
+        self.assertEqual(issue["code"], ISSUE_SNAPSHOT_CHAIN_BROKEN)
+        self.assertEqual(issue["snapshot_id"], 3)
+        self.assertEqual(issue["previous_snapshot_id"], 2)
+        self.assertEqual(issue["stored_prev_digest"], "f" * 64)
+        self.assertEqual(issue["expected_prev_digest"], entries[1]["digest"])
+        flags = {e["snapshot_id"]: e for e in result["entries"]}
+        self.assertTrue(flags[3]["content_ok"])  # 内容与错误 prev 自洽
+        self.assertFalse(flags[3]["link_ok"])
+
+    def test_first_issue_is_the_earliest_snapshot(self):
+        entries = _chain([1, 2, 3, 4])
+        entries[1]["state"] = {"x": 1}  # 快照 2 内容损坏
+        entries[3]["prev_digest"] = "e" * 64  # 快照 4 链断
+        result = verify_snapshot_chain(entries)
+        # 只报告首个可定位位置（快照 2）
+        self.assertEqual(result["first_issue"]["snapshot_id"], 2)
+        self.assertEqual(
+            result["first_issue"]["code"], ISSUE_SNAPSHOT_CONTENT_MISMATCH
+        )
+
+    def test_unchained_entry_detected(self):
+        entries = _chain([1, 2])
+        # 模拟“建链之后漏接”的快照
+        entries.append({
+            "id": 3,
+            "op_type": "network_import",
+            "network_version": 1,
+            "event_id": None,
+            "created_at": _datetime.datetime(2026, 10, 1, 9, 0, 0),
+            "state": {"k": 3},
+            "prev_digest": None,
+            "digest": None,
+        })
+        result = verify_snapshot_chain(entries)
+        self.assertFalse(result["chain_intact"])
+        self.assertEqual(result["first_issue"]["code"],
+                         ISSUE_SNAPSHOT_NOT_CHAINED)
+        self.assertEqual(result["first_issue"]["snapshot_id"], 3)
+        # 漏链接行之后不再继续核验
+        self.assertEqual(
+            [e["snapshot_id"] for e in result["entries"]], [1, 2, 3]
+        )
+
+    def test_non_contiguous_ids_are_not_breaks(self):
+        # 实际存在的快照编号为 1, 2, 5（回滚造成 3/4 空洞）：不算断链
+        entries = []
+        prev = GENESIS_DIGEST
+        for sid in [1, 2, 5]:
+            e = _chain_entry(sid, prev=prev)
+            entries.append(e)
+            prev = e["digest"]
+        result = verify_snapshot_chain(entries)
+        self.assertTrue(result["chain_intact"])
+        self.assertEqual(
+            [e["snapshot_id"] for e in result["entries"]], [1, 2, 5]
+        )
+
+    def test_network_import_version_reset_does_not_break_chain(self):
+        # 快照 5 是整网导入（版本重置为 1），但其编号继续递增、prev 仍接链尾
+        entries = []
+        prev = GENESIS_DIGEST
+        specs = [
+            (1, "network_import", 1),
+            (2, "isolation_submit", 2),
+            (3, "restore_confirm", 3),
+            (4, "source_switch", 4),
+            (5, "network_import", 1),  # 版本重置
+        ]
+        for sid, op, ver in specs:
+            e = _chain_entry(sid, prev=prev, op_type=op, network_version=ver,
+                             state={"v": ver})
+            entries.append(e)
+            prev = e["digest"]
+        result = verify_snapshot_chain(entries)
+        self.assertTrue(result["chain_intact"])
+        self.assertEqual(entries[4]["network_version"], 1)
+        self.assertEqual(entries[4]["prev_digest"], entries[3]["digest"])
+
 
 if __name__ == "__main__":
     unittest.main()

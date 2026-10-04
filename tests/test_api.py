@@ -17,7 +17,13 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from app import db  # noqa: E402
 from app.main import app  # noqa: E402
-from app.planning import Node, Pipe, freeze_state  # noqa: E402
+from app.planning import (  # noqa: E402
+    Node,
+    Pipe,
+    GENESIS_DIGEST,
+    compute_snapshot_digest,
+    freeze_state,
+)
 
 
 class FakeStore:
@@ -31,6 +37,11 @@ class FakeStore:
         self.snapshots = []
         self.next_snapshot_id = 1
         self.fail_commit = False
+        # 审计摘要链：测试替身默认“已启用”，每条新快照写入时即在同事务接链；
+        # 建链起点默认为空（首条快照锚定创世摘要），个别用例可手动改写。
+        self.chain_enabled = True
+        self.chain_start_snapshot_id = None
+        self.chain_built_at = None
 
 
 STORE = FakeStore()
@@ -58,6 +69,9 @@ def fake_transaction():
         "next_id": STORE.next_event_id,
         "snapshots": list(STORE.snapshots),
         "next_snapshot_id": STORE.next_snapshot_id,
+        "chain_enabled": STORE.chain_enabled,
+        "chain_start_snapshot_id": STORE.chain_start_snapshot_id,
+        "chain_built_at": STORE.chain_built_at,
     }
     try:
         yield conn
@@ -71,10 +85,15 @@ def fake_transaction():
         STORE.next_event_id = tmp["next_id"]
         STORE.snapshots = tmp["snapshots"]
         STORE.next_snapshot_id = tmp["next_snapshot_id"]
+        STORE.chain_enabled = tmp["chain_enabled"]
+        STORE.chain_start_snapshot_id = tmp["chain_start_snapshot_id"]
+        STORE.chain_built_at = tmp["chain_built_at"]
         raise
 
 
 def fake_init_db():
+    # 模拟启动建链：替身默认直接视为已启用、无存量快照；
+    # 个别“首启建链”用例自行调用 fake_ensure_snapshot_chain。
     return None
 
 
@@ -94,11 +113,30 @@ def fake_freeze_current():
     return freeze_state(dict(STORE.nodes), dict(STORE.pipes), fake_open_faults())
 
 
-def fake_insert_state_snapshot(conn, *, op_type, network_version, state, event_id=None):
+def fake_insert_state_snapshot(
+    conn, *, op_type, network_version, state, event_id=None, chain=True
+):
     import datetime
 
     sid = STORE.next_snapshot_id
     STORE.next_snapshot_id += 1
+    created_at = datetime.datetime(2026, 9, 30, 12, 0, 0)
+    prev_digest = None
+    digest = None
+    chained_at = None
+    if chain:
+        chained = [s for s in STORE.snapshots if s["digest"] is not None]
+        prev_digest = chained[-1]["digest"] if chained else GENESIS_DIGEST
+        digest = compute_snapshot_digest(
+            snapshot_id=sid,
+            op_type=op_type,
+            network_version=network_version,
+            event_id=event_id,
+            created_at=created_at,
+            state=state,
+            prev_digest=prev_digest,
+        )
+        chained_at = created_at
     STORE.snapshots.append(
         {
             "id": sid,
@@ -106,10 +144,79 @@ def fake_insert_state_snapshot(conn, *, op_type, network_version, state, event_i
             "network_version": network_version,
             "event_id": event_id,
             "state": state,
-            "created_at": datetime.datetime(2026, 9, 30, 12, 0, 0),
+            "created_at": created_at,
+            "prev_digest": prev_digest,
+            "digest": digest,
+            "chained_at": chained_at,
         }
     )
     return sid
+
+
+def fake_ensure_snapshot_chain(conn):
+    """镜像 db._ensure_snapshot_chain：为现存未链接快照按编号补链并标起点。"""
+    if STORE.chain_enabled:
+        return
+    import datetime
+
+    prev_digest = GENESIS_DIGEST
+    built_at = datetime.datetime(2026, 9, 30, 12, 0, 0)
+    start_id = None
+    for s in STORE.snapshots:
+        if s["digest"] is not None:
+            prev_digest = s["digest"]
+            continue
+        digest = compute_snapshot_digest(
+            snapshot_id=s["id"],
+            op_type=s["op_type"],
+            network_version=s["network_version"],
+            event_id=s["event_id"],
+            created_at=s["created_at"],
+            state=s["state"],
+            prev_digest=prev_digest,
+        )
+        s["prev_digest"] = prev_digest
+        s["digest"] = digest
+        s["chained_at"] = built_at
+        if start_id is None:
+            start_id = s["id"]
+        prev_digest = digest
+    STORE.chain_enabled = True
+    STORE.chain_start_snapshot_id = start_id
+    STORE.chain_built_at = built_at
+
+
+def fake_get_snapshot_chain_status(conn):
+    chained = [s for s in STORE.snapshots if s["digest"] is not None]
+    effective_start = chained[0]["id"] if chained else None
+    start_id = (
+        STORE.chain_start_snapshot_id
+        if STORE.chain_start_snapshot_id is not None
+        else effective_start
+    )
+    return {
+        "enabled": STORE.chain_enabled,
+        "chain_version": 1,
+        "start_snapshot_id": start_id,
+        "genesis_digest": GENESIS_DIGEST,
+        "built_at": STORE.chain_built_at,
+        "snapshot_count": len(STORE.snapshots),
+        "unchained_count": len(STORE.snapshots) - len(chained),
+        "last_snapshot_id": chained[-1]["id"] if chained else None,
+        "last_digest": chained[-1]["digest"] if chained else None,
+    }
+
+
+def fake_snapshot_exists(conn, snapshot_id):
+    return any(s["id"] == snapshot_id for s in STORE.snapshots)
+
+
+def fake_list_snapshot_chain_rows(conn, start_id, end_id):
+    return [
+        s
+        for s in STORE.snapshots
+        if start_id <= s["id"] <= end_id
+    ]
 
 
 def fake_replace_network(conn, nodes, pipes):
@@ -271,6 +378,10 @@ db.insert_state_snapshot = fake_insert_state_snapshot
 db.get_state_snapshot = fake_get_state_snapshot
 db.list_state_snapshots = fake_list_state_snapshots
 db.get_previous_state_snapshot = fake_get_previous_state_snapshot
+db.get_snapshot_chain_status = fake_get_snapshot_chain_status
+db.snapshot_exists = fake_snapshot_exists
+db.list_snapshot_chain_rows = fake_list_snapshot_chain_rows
+db._ensure_snapshot_chain = fake_ensure_snapshot_chain
 
 
 VALID_NETWORK = {
@@ -355,6 +466,9 @@ class ApiTests(unittest.TestCase):
         STORE.snapshots = []
         STORE.next_snapshot_id = 1
         STORE.fail_commit = False
+        STORE.chain_enabled = True
+        STORE.chain_start_snapshot_id = None
+        STORE.chain_built_at = None
 
     def _import(self):
         r = self.client.post("/api/network/import", json=VALID_NETWORK)
@@ -1539,6 +1653,353 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(r.json()["error"]["code"], "SNAPSHOT_NOT_FOUND")
 
 
+class SnapshotChainApiTests(unittest.TestCase):
+    """调度审计摘要链 HTTP 契约（只读核验 + 建链状态）。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client = TestClient(app)
+
+    def setUp(self):
+        STORE.version = 0
+        STORE.nodes = {}
+        STORE.pipes = {}
+        STORE.events = []
+        STORE.next_event_id = 1
+        STORE.snapshots = []
+        STORE.next_snapshot_id = 1
+        STORE.fail_commit = False
+        STORE.chain_enabled = True
+        STORE.chain_start_snapshot_id = None
+        STORE.chain_built_at = None
+
+    def _make_chain(self, n=3):
+        """导入 + (n-1) 次操作，产生编号 1..n 的已链接快照，返回快照列表。"""
+        self.client.post("/api/network/import", json=VALID_NETWORK)  # 1
+        if n >= 2:
+            self.client.post(
+                "/api/isolation/submit",
+                json={"fault_pipe_id": "P6", "close_pipe_ids": ["P4"],
+                      "version": 1},
+            )  # 2
+        if n >= 3:
+            self.client.post(
+                "/api/isolation/events/1/restore", json={"version": 2}
+            )  # 3
+        return list(STORE.snapshots)
+
+    def test_chain_status_reports_enabled_genesis_and_tip(self):
+        snaps = self._make_chain(3)
+        r = self.client.get("/api/snapshots/chain/status")
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertTrue(body["enabled"])
+        self.assertEqual(body["chain_version"], 1)
+        self.assertEqual(body["genesis_digest"], GENESIS_DIGEST)
+        self.assertEqual(body["snapshot_count"], 3)
+        self.assertEqual(body["unchained_count"], 0)
+        self.assertEqual(body["last_snapshot_id"], 3)
+        self.assertEqual(body["last_digest"], snaps[-1]["digest"])
+        # 空库首启：建链起点随首条快照自然开始（最早已链接快照编号）
+        self.assertEqual(body["start_snapshot_id"], 1)
+
+    def test_existing_snapshot_endpoints_do_not_expose_chain_fields(self):
+        # 现有快照查询接口字段与含义保持不变：不含 digest/prev_digest/chained_at
+        self._make_chain(2)
+        r = self.client.get("/api/snapshots/2")
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertNotIn("digest", body)
+        self.assertNotIn("prev_digest", body)
+        self.assertNotIn("chained_at", body)
+        for row in self.client.get("/api/snapshots").json():
+            self.assertNotIn("digest", row)
+            self.assertNotIn("prev_digest", row)
+
+    def test_new_snapshots_are_chained_in_the_same_transaction(self):
+        snaps = self._make_chain(3)
+        # 每条快照都带摘要；首条锚定创世摘要，后续接前一条
+        self.assertEqual(snaps[0]["prev_digest"], GENESIS_DIGEST)
+        for prev, cur in zip(snaps, snaps[1:]):
+            self.assertEqual(cur["prev_digest"], prev["digest"])
+        self.assertIsNotNone(snaps[0]["chained_at"])
+
+    def test_verify_full_range_defaults_to_genesis(self):
+        snaps = self._make_chain(3)
+        r = self.client.post(
+            "/api/snapshots/chain/verify",
+            json={"start_id": 1, "end_id": 3},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertTrue(body["chain_intact"])
+        self.assertTrue(body["boundary_match"])
+        self.assertTrue(body["start_boundary_match"])
+        self.assertEqual(body["start_prev_digest"], GENESIS_DIGEST)
+        self.assertEqual(body["end_digest"], snaps[-1]["digest"])
+        self.assertIsNone(body["first_issue"])
+        self.assertEqual(
+            [e["snapshot_id"] for e in body["entries"]], [1, 2, 3]
+        )
+        for e in body["entries"]:
+            self.assertTrue(e["content_ok"] and e["link_ok"])
+            self.assertEqual(e["digest"], e["computed_digest"])
+
+    def test_verify_subrange_with_saved_anchors(self):
+        snaps = self._make_chain(3)
+        r = self.client.post(
+            "/api/snapshots/chain/verify",
+            json={
+                "start_id": 2,
+                "end_id": 3,
+                "start_prev_digest": snaps[0]["digest"],
+                "end_digest": snaps[2]["digest"],
+            },
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertTrue(body["boundary_match"])
+        self.assertTrue(body["start_boundary_match"])
+        self.assertTrue(body["end_digest_match"])
+
+    def test_verify_is_read_only(self):
+        self._make_chain(3)
+        before = [dict(s) for s in STORE.snapshots]
+        self.client.post(
+            "/api/snapshots/chain/verify", json={"start_id": 1, "end_id": 3}
+        )
+        after = [dict(s) for s in STORE.snapshots]
+        self.assertEqual(before, after)
+
+    def test_verify_returns_all_digests_even_with_end_mismatch(self):
+        snaps = self._make_chain(3)
+        r = self.client.post(
+            "/api/snapshots/chain/verify",
+            json={"start_id": 1, "end_id": 3, "end_digest": "a" * 64},
+        )
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertTrue(body["chain_intact"])
+        self.assertIsNone(body["first_issue"])  # 内部自洽
+        self.assertFalse(body["end_digest_match"])  # 仅边界不符
+        self.assertEqual(len(body["entries"]), 3)
+        self.assertEqual(body["end_digest"], snaps[-1]["digest"])
+
+    def test_verify_detects_post_hoc_state_tampering(self):
+        self._make_chain(3)
+        # 模拟事后直接改写冻结状态（绕过事务）
+        STORE.snapshots[1]["state"] = {"tampered": True}
+        r = self.client.post(
+            "/api/snapshots/chain/verify", json={"start_id": 1, "end_id": 3}
+        )
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertFalse(body["chain_intact"])
+        issue = body["first_issue"]
+        self.assertEqual(issue["code"], "SNAPSHOT_CONTENT_MISMATCH")
+        self.assertEqual(issue["snapshot_id"], 2)
+        self.assertNotEqual(issue["stored_digest"], issue["computed_digest"])
+
+    def test_verify_detects_broken_link_fork(self):
+        snaps = self._make_chain(3)
+        # 直接改 prev_digest 并把 digest 重算为与之自洽 -> 只能定位为链断裂
+        from app.planning import compute_snapshot_digest as _csd
+
+        snaps[2]["prev_digest"] = "f" * 64
+        snaps[2]["digest"] = _csd(
+            snapshot_id=3,
+            op_type=snaps[2]["op_type"],
+            network_version=snaps[2]["network_version"],
+            event_id=snaps[2]["event_id"],
+            created_at=snaps[2]["created_at"],
+            state=snaps[2]["state"],
+            prev_digest="f" * 64,
+        )
+        r = self.client.post(
+            "/api/snapshots/chain/verify", json={"start_id": 1, "end_id": 3}
+        )
+        body = r.json()
+        self.assertFalse(body["chain_intact"])
+        self.assertEqual(body["first_issue"]["code"], "SNAPSHOT_CHAIN_BROKEN")
+        self.assertEqual(body["first_issue"]["snapshot_id"], 3)
+
+    def test_verify_rollback_id_gap_is_not_a_break(self):
+        # 制造编号 1，然后人为挖出编号 2 的空洞（模拟回滚），再接快照 3
+        self._make_chain(1)
+        STORE.next_snapshot_id = 3
+        self.client.post(
+            "/api/isolation/submit",
+            json={"fault_pipe_id": "P6", "close_pipe_ids": ["P4"],
+                  "version": 1},
+        )
+        ids = [s["id"] for s in STORE.snapshots]
+        self.assertEqual(ids, [1, 3])  # 编号 2 空洞
+        # 端点 2 不存在 -> 明确报错
+        r = self.client.post(
+            "/api/snapshots/chain/verify", json={"start_id": 1, "end_id": 2}
+        )
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r.json()["error"]["code"], "SNAPSHOT_NOT_FOUND")
+        # 跨空洞核验实际存在的 1 与 3：不算断链
+        r = self.client.post(
+            "/api/snapshots/chain/verify", json={"start_id": 1, "end_id": 3}
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertTrue(body["chain_intact"])
+        self.assertEqual(
+            [e["snapshot_id"] for e in body["entries"]], [1, 3]
+        )
+        self.assertEqual(
+            body["entries"][1]["prev_digest"], STORE.snapshots[0]["digest"]
+        )
+
+    def test_verify_missing_endpoints_explicit_errors(self):
+        self._make_chain(2)
+        # 起始端点不存在
+        r = self.client.post(
+            "/api/snapshots/chain/verify", json={"start_id": 9, "end_id": 10}
+        )
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r.json()["error"]["code"], "SNAPSHOT_NOT_FOUND")
+        # 终止端点不存在
+        r = self.client.post(
+            "/api/snapshots/chain/verify", json={"start_id": 1, "end_id": 9}
+        )
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r.json()["error"]["code"], "SNAPSHOT_NOT_FOUND")
+
+    def test_verify_reversed_range_is_explicit_error(self):
+        self._make_chain(2)
+        r = self.client.post(
+            "/api/snapshots/chain/verify", json={"start_id": 2, "end_id": 1}
+        )
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "SNAPSHOT_RANGE_INVALID")
+
+    def test_verify_rejects_malformed_digests(self):
+        self._make_chain(1)
+        r = self.client.post(
+            "/api/snapshots/chain/verify",
+            json={"start_id": 1, "end_id": 1, "start_prev_digest": "xyz"},
+        )
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(
+            r.json()["error"]["code"], "SNAPSHOT_CHAIN_DIGEST_INVALID"
+        )
+        r = self.client.post(
+            "/api/snapshots/chain/verify",
+            json={"start_id": 1, "end_id": 1, "end_digest": "Z" * 64},
+        )
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(
+            r.json()["error"]["code"], "SNAPSHOT_CHAIN_DIGEST_INVALID"
+        )
+
+    def test_verify_accepts_uppercase_digest(self):
+        snaps = self._make_chain(1)
+        r = self.client.post(
+            "/api/snapshots/chain/verify",
+            json={"start_id": 1, "end_id": 1,
+                  "end_digest": snaps[0]["digest"].upper()},
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.json()["end_digest_match"])
+
+    def test_verify_request_body_validation(self):
+        self._make_chain(1)
+        # start_id < 1 -> 422 请求校验
+        r = self.client.post(
+            "/api/snapshots/chain/verify", json={"start_id": 0, "end_id": 1}
+        )
+        self.assertEqual(r.status_code, 422)
+
+    def test_network_reimport_resets_version_but_chain_continues(self):
+        self._make_chain(2)
+        r = self.client.post("/api/network/import", json=VALID_NETWORK)
+        self.assertEqual(r.status_code, 200)
+        new_id = r.json()["snapshot_id"]  # 编号 3，版本重置为 1
+        self.assertEqual(new_id, 3)
+        r = self.client.post(
+            "/api/snapshots/chain/verify", json={"start_id": 1, "end_id": 3}
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertTrue(body["chain_intact"])
+        # 快照 3（重导）仍接在快照 2 之后，尽管版本重置
+        self.assertEqual(
+            body["entries"][2]["prev_digest"],
+            body["entries"][1]["digest"],
+        )
+
+    def test_noop_switch_snapshot_is_not_created_and_chain_unaffected(self):
+        self._make_chain(1)
+        r = self.client.post(
+            "/api/sources/switch",
+            json={"targets": [{"source_id": "S", "running": True}],
+                  "version": 1},
+        )
+        self.assertEqual(r.json()["snapshot_id"], None)
+        body = self.client.post(
+            "/api/snapshots/chain/verify",
+            json={"start_id": 1, "end_id": 1},
+        ).json()
+        self.assertTrue(body["chain_intact"])
+
+    def test_first_enable_backfill_chains_existing_snapshots(self):
+        # 模拟首启前的存量：链未启用时已写入两条历史快照（无链字段）
+        STORE.chain_enabled = False
+        self.client.post("/api/network/import", json=VALID_NETWORK)
+        self.client.post(
+            "/api/isolation/submit",
+            json={"fault_pipe_id": "P6", "close_pipe_ids": ["P4"],
+                  "version": 1},
+        )
+        for s in STORE.snapshots:
+            s["prev_digest"] = None
+            s["digest"] = None
+            s["chained_at"] = None
+        self.assertEqual(len(STORE.snapshots), 2)
+
+        # 首启建链：为存量补链并标起点
+        fake_ensure_snapshot_chain("FAKE_CONN")
+        self.assertTrue(STORE.chain_enabled)
+        self.assertEqual(STORE.chain_start_snapshot_id, 1)
+        self.assertIsNotNone(STORE.chain_built_at)
+        self.assertEqual(STORE.snapshots[0]["prev_digest"], GENESIS_DIGEST)
+        self.assertEqual(
+            STORE.snapshots[1]["prev_digest"], STORE.snapshots[0]["digest"]
+        )
+        # 建链后核验通过
+        body = self.client.post(
+            "/api/snapshots/chain/verify",
+            json={"start_id": 1, "end_id": 2},
+        ).json()
+        self.assertTrue(body["chain_intact"])
+
+    def test_unchained_snapshot_after_enable_is_flagged(self):
+        # 建链之后出现漏接快照（异常场景）-> SNAPSHOT_NOT_CHAINED
+        self._make_chain(2)
+        STORE.next_snapshot_id += 1  # 编号 3 空洞
+        sid = fake_insert_state_snapshot(
+            "FAKE_CONN",
+            op_type="source_switch",
+            network_version=3,
+            state={"x": 1},
+            chain=False,
+        )
+        self.assertEqual(sid, 4)
+        r = self.client.post(
+            "/api/snapshots/chain/verify", json={"start_id": 1, "end_id": 4}
+        )
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertEqual(
+            body["first_issue"]["code"], "SNAPSHOT_NOT_CHAINED"
+        )
+        self.assertEqual(body["first_issue"]["snapshot_id"], 4)
+
+
 # 流量核算请求样例（基于 VALID_NETWORK：S-P1-A-P2-B-P4-D-P6-U3；A-P3-U1；B-P5-U2）
 def _delivery_body(version=1, *, source_cap=100, pipe_caps=None, demands=None):
     return {
@@ -1573,6 +2034,9 @@ class DeliveryApiTests(unittest.TestCase):
         STORE.snapshots = []
         STORE.next_snapshot_id = 1
         STORE.fail_commit = False
+        STORE.chain_enabled = True
+        STORE.chain_start_snapshot_id = None
+        STORE.chain_built_at = None
 
     def _import(self, network=VALID_NETWORK):
         r = self.client.post("/api/network/import", json=network)
@@ -1840,6 +2304,9 @@ class DeliveryAllocateApiTests(unittest.TestCase):
         STORE.snapshots = []
         STORE.next_snapshot_id = 1
         STORE.fail_commit = False
+        STORE.chain_enabled = True
+        STORE.chain_start_snapshot_id = None
+        STORE.chain_built_at = None
 
     def _import(self, network=VALID_NETWORK):
         r = self.client.post("/api/network/import", json=network)
@@ -2111,6 +2578,9 @@ class MeterReconcileApiTests(unittest.TestCase):
         STORE.snapshots = []
         STORE.next_snapshot_id = 1
         STORE.fail_commit = False
+        STORE.chain_enabled = True
+        STORE.chain_start_snapshot_id = None
+        STORE.chain_built_at = None
 
     def _import(self, network=VALID_NETWORK):
         r = self.client.post("/api/network/import", json=network)
@@ -2391,6 +2861,9 @@ class DrillApiTests(unittest.TestCase):
         STORE.snapshots = []
         STORE.next_snapshot_id = 1
         STORE.fail_commit = False
+        STORE.chain_enabled = True
+        STORE.chain_start_snapshot_id = None
+        STORE.chain_built_at = None
 
     def _import(self, network=RESTORE_NETWORK):
         r = self.client.post("/api/network/import", json=network)
@@ -2761,6 +3234,9 @@ class DeliveryBypassApiTests(unittest.TestCase):
         STORE.snapshots = []
         STORE.next_snapshot_id = 1
         STORE.fail_commit = False
+        STORE.chain_enabled = True
+        STORE.chain_start_snapshot_id = None
+        STORE.chain_built_at = None
 
     def _import(self, network=VALID_NETWORK):
         r = self.client.post("/api/network/import", json=network)

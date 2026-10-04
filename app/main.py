@@ -22,6 +22,10 @@
 - GET  /api/snapshots                                  快照列表（按编号升序，支持 after 游标）
 - GET  /api/snapshots/{snapshot_id}                    按编号读取冻结快照（节点/水源/阀位/待修复故障/供水点）
 - GET  /api/snapshots/{snapshot_id}/diff               与相邻上一条快照的六类净变化（可用 base_id 指定对照基线）
+
+调度审计（摘要链，只读核验）：
+- GET  /api/snapshots/chain/status                     摘要链建链状态（启用标记、建链起点、创世/链尾摘要）
+- POST /api/snapshots/chain/verify                     按起止编号闭区间只读核验，返回各条摘要与首个损坏/断裂位置
 """
 from contextlib import asynccontextmanager
 
@@ -41,6 +45,8 @@ from .planning import (
     evaluate_plan,
     evaluate_restore,
     evaluate_source_switch,
+    is_sha256_hex,
+    normalize_digest,
     recommend_plan,
     simulate_drill,
     validate_bypass_request,
@@ -48,6 +54,8 @@ from .planning import (
     validate_reconcile_request,
     reconcile_meters,
     validate_import,
+    verify_snapshot_chain,
+    GENESIS_DIGEST,
     BLOCKING_ISSUE_CODES,
     DRILL_STEP_ISOLATION,
     DRILL_STEP_RESTORE,
@@ -84,6 +92,9 @@ from .schemas import (
     SnapshotOut,
     SnapshotMetaOut,
     SnapshotDiffOut,
+    SnapshotChainVerifyIn,
+    SnapshotChainVerifyOut,
+    SnapshotChainStatusOut,
 )
 from .serializers import (
     serialize_preview,
@@ -118,7 +129,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="供水管网故障隔离服务",
-    version="1.3.0",
+    version="1.4.0",
     lifespan=lifespan,
 )
 
@@ -800,6 +811,87 @@ def diff_snapshot(
     # 只基于两份冻结载荷计算，绝不读取当前管网或后续事件回填
     diff = diff_states(base["state"] if base else None, target["state"])
     return serialize_snapshot_diff(base, target, diff)
+
+
+# ------------------------------------------------------------ 调度审计（摘要链，只读核验）
+
+
+@app.get(
+    "/api/snapshots/chain/status",
+    response_model=SnapshotChainStatusOut,
+    tags=["审计摘要链"],
+    summary="摘要链状态：是否已启用、建链起点、创世摘要与链尾摘要",
+)
+def get_snapshot_chain_status():
+    with db.get_conn() as conn:
+        return db.get_snapshot_chain_status(conn)
+
+
+@app.post(
+    "/api/snapshots/chain/verify",
+    response_model=SnapshotChainVerifyOut,
+    tags=["审计摘要链"],
+    summary="只读核验摘要链区间：返回各条摘要与首个可定位的内容损坏或链路断裂位置",
+)
+def verify_snapshots(payload: SnapshotChainVerifyIn):
+    # 倒序区间明确报错（不做静默交换）
+    if payload.end_id < payload.start_id:
+        raise ApiError(
+            422,
+            "SNAPSHOT_RANGE_INVALID",
+            f"核验区间倒序：起始编号 {payload.start_id} 大于终止编号 {payload.end_id}",
+        )
+
+    # 边界摘要格式：64 位十六进制 SHA-256（大小写不敏感，内部统一按小写比较）
+    if (
+        payload.start_prev_digest is not None
+        and not is_sha256_hex(payload.start_prev_digest)
+    ):
+        raise ApiError(
+            422,
+            "SNAPSHOT_CHAIN_DIGEST_INVALID",
+            "start_prev_digest 必须为 64 位十六进制 SHA-256 摘要",
+        )
+    if payload.end_digest is not None and not is_sha256_hex(payload.end_digest):
+        raise ApiError(
+            422,
+            "SNAPSHOT_CHAIN_DIGEST_INVALID",
+            "end_digest 必须为 64 位十六进制 SHA-256 摘要",
+        )
+
+    start_prev_digest = (
+        normalize_digest(payload.start_prev_digest)
+        if payload.start_prev_digest is not None
+        else GENESIS_DIGEST
+    )
+    expected_end_digest = (
+        normalize_digest(payload.end_digest) if payload.end_digest is not None else None
+    )
+
+    # 全程只读：端点不存在（含回滚编号空洞）明确报错，不静默扩大/收缩区间
+    with db.get_conn() as conn:
+        if not db.snapshot_exists(conn, payload.start_id):
+            raise ApiError(
+                404,
+                "SNAPSHOT_NOT_FOUND",
+                f"起始快照不存在：{payload.start_id}"
+                "（快照编号不可复用，回滚事务可能在编号序列上留下空洞）",
+            )
+        if not db.snapshot_exists(conn, payload.end_id):
+            raise ApiError(
+                404,
+                "SNAPSHOT_NOT_FOUND",
+                f"终止快照不存在：{payload.end_id}"
+                "（快照编号不可复用，回滚事务可能在编号序列上留下空洞）",
+            )
+        # 按“实际存在的快照编号顺序”取区间：回滚空洞不出现在结果中，不算断链
+        rows = db.list_snapshot_chain_rows(conn, payload.start_id, payload.end_id)
+
+    return verify_snapshot_chain(
+        rows,
+        start_prev_digest=start_prev_digest,
+        end_digest=expected_end_digest,
+    )
 
 
 # ---------------------------------------------------------------- 调度演练（只读）

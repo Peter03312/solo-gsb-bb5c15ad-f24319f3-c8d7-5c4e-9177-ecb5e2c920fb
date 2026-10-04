@@ -2545,3 +2545,312 @@ def diff_states(base: dict | None, target: dict) -> dict:
         "open_faults": {"added": fault_added, "removed": fault_removed},
         "supplied_sinks": {"added": sink_added, "removed": sink_removed},
     }
+
+
+# ================================================================
+# 快照摘要链（调度审计：事后改写检测，纯领域逻辑，不依赖数据库）
+# ====================================================
+#
+# 按“实际存在的快照编号顺序”建立连续 SHA-256 摘要链：
+#   digest_n = SHA256(canonical(payload_n))
+# payload 以固定、可复现的编码覆盖：快照编号、操作类型、管网版本、
+# 关联事件、创建时间、完整冻结状态以及前一条摘要；首条使用固定创世摘要。
+# 整网导入即使版本重置为 1，快照编号仍单调递增，链不断。
+#
+# 编码规则（CHAIN_VERSION 随算法变更而递增）：
+# - 载荷为单行 JSON 对象，键按字典序，紧凑分隔符
+#   （json.dumps(..., sort_keys=True, separators=(",", ":"), ensure_ascii=False)），
+#   UTF-8 编码；
+# - state（完整冻结状态）直接以同样的 canonical JSON 作为嵌套对象序列化；
+# - created_at 统一归一化为 UTC 微秒精度、以 "Z" 结尾的 ISO 8601 字符串。
+import hashlib
+import json
+import re
+from datetime import datetime, timezone
+
+# 摘要链算法版本：编码语义变更时递增；已冻结的编码不可静默改变。
+CHAIN_VERSION = 1
+
+# 首条快照之前使用的固定创世摘要（全链共同的唯一信任起点）。
+# 取 SHA256 十六进制串：
+#   sha256("water-network snapshot chain v1 genesis".encode("utf-8")).hexdigest()
+GENESIS_DIGEST = hashlib.sha256(
+    "water-network snapshot chain v1 genesis".encode("utf-8")
+).hexdigest()
+
+HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def is_sha256_hex(value) -> bool:
+    """是否为 64 位十六进制摘要（大小写不敏感，校验后统一按小写比较）。"""
+    return isinstance(value, str) and HEX64_RE.match(value.lower()) is not None
+
+
+def normalize_digest(value: str) -> str:
+    """把摘要归一化为小写；调用方应先用 is_sha256_hex 校验格式。"""
+    return value.lower()
+
+
+def normalize_created_at(created_at) -> str:
+    """把创建时间归一化为 UTC 微秒精度、Z 结尾的 ISO 8601 字符串。
+
+    接受：
+    - 带时区的 datetime（转换为 UTC；naive datetime 按 UTC 解释）；
+    - 已格式化的字符串（末尾 Z 或显式偏移），归一化到同一表示。
+    PostgreSQL TIMESTAMPTZ 经 psycopg2 取出即为带时区 datetime，
+    内存替身中的 naive datetime 与 JSON 字符串也可被同一规则复现。
+    """
+    if isinstance(created_at, datetime):
+        dt = created_at
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    elif isinstance(created_at, str):
+        text = created_at.strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        dt = parsed
+    else:
+        raise ValueError(f"无法识别的创建时间类型：{type(created_at)!r}")
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+
+
+def snapshot_digest_payload(
+    *,
+    snapshot_id: int,
+    op_type: str,
+    network_version: int,
+    event_id: int | None,
+    created_at,
+    state: dict,
+    prev_digest: str,
+) -> bytes:
+    """构造可复现的摘要输入字节（canonical JSON，UTF-8）。
+
+    覆盖字段：chain_version、id、op_type、network_version、event_id、
+    created_at（归一化）、state（完整冻结状态的 canonical JSON）、prev_digest。
+    state 先经 json 往返（与 JSONB 存取往返一致），再作为嵌套对象参与序列化，
+    键序由外层 sort_keys 统一保证，嵌套字典键序同样得到保证。
+    """
+    document = {
+        "chain_version": CHAIN_VERSION,
+        "id": snapshot_id,
+        "op_type": op_type,
+        "network_version": network_version,
+        "event_id": event_id,
+        "created_at": normalize_created_at(created_at),
+        "state": json.loads(json.dumps(state, ensure_ascii=False)),
+        "prev_digest": prev_digest,
+    }
+    return json.dumps(
+        document,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def compute_snapshot_digest(
+    *,
+    snapshot_id: int,
+    op_type: str,
+    network_version: int,
+    event_id: int | None,
+    created_at,
+    state: dict,
+    prev_digest: str,
+) -> str:
+    """按固定可复现编码计算单条快照的 SHA-256 摘要（小写十六进制）。"""
+    return hashlib.sha256(
+        snapshot_digest_payload(
+            snapshot_id=snapshot_id,
+            op_type=op_type,
+            network_version=network_version,
+            event_id=event_id,
+            created_at=created_at,
+            state=state,
+            prev_digest=prev_digest,
+        )
+    ).hexdigest()
+
+
+# 核验问题代码
+ISSUE_SNAPSHOT_NOT_CHAINED = "SNAPSHOT_NOT_CHAINED"  # 首启建链之后仍有漏链接快照
+ISSUE_SNAPSHOT_CONTENT_MISMATCH = "SNAPSHOT_CONTENT_MISMATCH"  # 摘要对不上冻结内容
+ISSUE_SNAPSHOT_CHAIN_BROKEN = "SNAPSHOT_CHAIN_BROKEN"  # 前链指针与上一条不符
+
+
+def _entry_self_digest(entry: dict) -> str | None:
+    """按条目自身存储的 prev_digest 重算内容摘要（内容核验与链路核验相互独立）。"""
+    prev_digest = entry.get("prev_digest")
+    if not prev_digest:
+        return None
+    return compute_snapshot_digest(
+        snapshot_id=entry["id"],
+        op_type=entry["op_type"],
+        network_version=entry["network_version"],
+        event_id=entry.get("event_id"),
+        created_at=entry["created_at"],
+        state=entry["state"],
+        prev_digest=prev_digest,
+    )
+
+
+def verify_snapshot_chain(
+    entries: list[dict],
+    *,
+    start_prev_digest: str = GENESIS_DIGEST,
+    end_digest: str | None = None,
+) -> dict:
+    """只读核验编号连续区间（entries 已按 id 升序，允许回滚造成的编号空洞）。
+
+    每个 entry 至少包含：id / op_type / network_version / event_id / created_at /
+    state / prev_digest（首启建链之前写入的历史快照可能为 None）/ digest。
+
+    逐行做两件相互独立的核验：
+    - 内容核验：以该行**自身存储**的 prev_digest 重算摘要，与存储摘要比对，
+      任一覆盖字段（编号、操作类型、管网版本、关联事件、创建时间、完整冻结
+      状态、前链摘要）事后被改写都会失配；
+    - 内部链路核验：除区间首行外，每行存储的 prev_digest 必须等于“编号上一条
+      实际存在快照”的存储摘要（回滚空洞不参与，不视为断链）。
+
+    两个**外部边界**单独比对、不计入内部 first_issue：
+    - 区间首行的 prev_digest 对照审计员事先保存的起点前摘要（缺省为创世摘要）；
+    - 区间末行的 digest 对照审计员事先保存的终点摘要。
+    区间内部自洽但边界不符（历史在区间之前被整体重写/分叉）时只报告边界
+    不符（start_boundary_match / end_digest_match 为 false），first_issue
+    仍为 None。返回各条摘要与首个可定位的内部问题 first_issue。
+    """
+    result_entries: list[dict] = []
+    first_issue: dict | None = None
+
+    def record(issue: dict) -> None:
+        nonlocal first_issue
+        if first_issue is None:
+            first_issue = issue
+
+    prev_id: int | None = None
+    prev_stored_digest: str | None = None  # 首行无“区间内”上一条：边界单独核验
+    for index, entry in enumerate(entries):
+        is_first_in_range = index == 0
+        stored_digest = entry.get("digest")
+        stored_prev = entry.get("prev_digest")
+        computed = _entry_self_digest(entry) if stored_prev else None
+
+        # 1) 漏链接：首启建链之后仍存在未写摘要指针的快照
+        if not stored_prev or not stored_digest:
+            record({
+                "code": ISSUE_SNAPSHOT_NOT_CHAINED,
+                "snapshot_id": entry["id"],
+                "previous_snapshot_id": prev_id,
+                "message": (
+                    f"快照 {entry['id']} 未接入摘要链（缺少摘要或前链指针），"
+                    "首启建链之后的每条快照都必须在原状态变更事务内接链"
+                ),
+                "stored_digest": stored_digest,
+                "computed_digest": computed,
+                "expected_prev_digest": prev_stored_digest,
+                "stored_prev_digest": stored_prev,
+            })
+            result_entries.append({
+                "snapshot_id": entry["id"],
+                "digest": stored_digest,
+                "computed_digest": computed,
+                "prev_digest": stored_prev,
+                "content_ok": False,
+                "link_ok": False,
+            })
+            # 未链接行无法作为后续行的锚点；链在此处即已断裂，停止后续核验
+            break
+
+        # 2) 内部链路核验（区间首行对照外部起点前摘要，仅作边界标记，不断言断裂）
+        if is_first_in_range:
+            link_ok = True
+        else:
+            link_ok = stored_prev == prev_stored_digest
+        if not link_ok:
+            record({
+                "code": ISSUE_SNAPSHOT_CHAIN_BROKEN,
+                "snapshot_id": entry["id"],
+                "previous_snapshot_id": prev_id,
+                "message": (
+                    f"快照 {entry['id']} 的前链摘要与其编号上一条实际存在快照"
+                    f"（{prev_id}）的摘要不符，摘要链断裂"
+                ),
+                "stored_digest": stored_digest,
+                "computed_digest": computed,
+                "expected_prev_digest": prev_stored_digest,
+                "stored_prev_digest": stored_prev,
+            })
+
+        # 3) 内容核验：以该行自身存储的 prev_digest 重算并比对
+        content_ok = computed == stored_digest
+        if not content_ok and link_ok:
+            record({
+                "code": ISSUE_SNAPSHOT_CONTENT_MISMATCH,
+                "snapshot_id": entry["id"],
+                "previous_snapshot_id": prev_id,
+                "message": (
+                    f"快照 {entry['id']} 的重算摘要与存储摘要不符，"
+                    "其冻结内容或链字段在事后被改写"
+                ),
+                "stored_digest": stored_digest,
+                "computed_digest": computed,
+                "expected_prev_digest": prev_stored_digest,
+                "stored_prev_digest": stored_prev,
+            })
+
+        result_entries.append({
+            "snapshot_id": entry["id"],
+            "digest": stored_digest,
+            "computed_digest": computed,
+            "prev_digest": stored_prev,
+            "content_ok": bool(content_ok),
+            "link_ok": bool(link_ok),
+        })
+
+        prev_id = entry["id"]
+        prev_stored_digest = stored_digest
+
+    chain_intact = first_issue is None and all(
+        e["content_ok"] and e["link_ok"] for e in result_entries
+    )
+    last_entry = entries[-1] if entries else None
+    last_digest = last_entry.get("digest") if last_entry else None
+
+    # 外部边界（只标记、不计入 first_issue）：
+    # - 起点边界：区间首行的前链摘要是否等于审计员保存的起点前摘要；
+    # - 终点边界：内部自洽时，末行摘要是否等于审计员保存的终点摘要。
+    start_boundary_match: bool | None = None
+    end_digest_match: bool | None = None
+    if entries:
+        first = entries[0]
+        start_boundary_match = (
+            bool(first.get("prev_digest"))
+            and first["prev_digest"] == start_prev_digest
+        )
+        if end_digest is not None:
+            end_digest_match = bool(chain_intact) and last_digest == end_digest
+
+    boundary_match = (
+        chain_intact
+        and start_boundary_match is True
+        and (end_digest is None or end_digest_match is True)
+    )
+
+    return {
+        "start_snapshot_id": entries[0]["id"] if entries else None,
+        "end_snapshot_id": last_entry["id"] if last_entry else None,
+        "chain_intact": bool(chain_intact),
+        "boundary_match": bool(boundary_match),
+        "start_prev_digest": start_prev_digest,
+        "start_boundary_match": start_boundary_match,
+        "end_digest": last_digest,
+        "expected_end_digest": end_digest,
+        "end_digest_match": end_digest_match,
+        "entries": result_entries,
+        "first_issue": first_issue,
+    }
